@@ -2,12 +2,8 @@
 STEP 1 of the pipeline. Run this 8 hours before a scheduled slot time.
 
 Picks the next unprocessed video from Drive, generates metadata with Groq,
-uploads it to YouTube as UNLISTED (visible via link, not searchable), makes
-the Drive file link-shareable (needed for Instagram later), and queues it
-in publish_queue.json with the target public/live time.
-
-Does NOT touch Instagram yet -- that happens in publish_scheduled.py at the
-actual go-live moment, since Instagram can't be uploaded ahead and held.
+uploads it to YouTube as UNLISTED (visible via link, not searchable), and
+queues it in publish_queue.json with the target public/live time.
 
     python upload_unlisted.py --slot A
     python upload_unlisted.py --slot B
@@ -18,15 +14,17 @@ Slot times are read from .env (SLOT_A_TIME, SLOT_B_TIME, daily, in TIMEZONE).
 import argparse
 import logging
 import os
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from auth import get_credentials
 from metadata_generator import generate_metadata
+from services.telegram import TelegramClient, build_video_caption
 from utils import load_json, save_json
 
 load_dotenv()
@@ -53,7 +51,7 @@ SLOT_TIMES = {
 
 LOG_FILE = "processed_log.json"
 QUEUE_FILE = "publish_queue.json"
-TEMP_DIR = "temp_downloads"
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_downloads")
 
 
 # ---------------------------------------------------------------------------
@@ -70,19 +68,14 @@ def list_drive_videos(drive, folder_id: str) -> list[dict]:
     return [f for f in results.get("files", []) if f["mimeType"].startswith("video/")]
 
 
-def make_shareable(drive, file_id: str) -> str:
-    """Grant anyone-with-link viewer access and return a direct-download URL."""
-    drive.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-    ).execute()
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
-
-
 def download_video(drive, file_id: str, filename: str) -> str:
     """Download *file_id* from Drive into TEMP_DIR and return the local path."""
     os.makedirs(TEMP_DIR, exist_ok=True)
-    local_path = os.path.join(TEMP_DIR, filename)
+    safe_name = filename.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+    safe_name = re.sub(r'[<>:"/|?*\x00-\x1f]', "_", safe_name).strip(" .")
+    if not safe_name:
+        safe_name = f"{file_id}.video"
+    local_path = os.path.join(TEMP_DIR, safe_name)
     request = drive.files().get_media(fileId=file_id)
     with open(local_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
@@ -129,14 +122,19 @@ def upload_unlisted_youtube(
             "selfDeclaredMadeForKids": False,
         },
     }
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/*")
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    with open(video_path, "rb") as video_file:
+        media = MediaIoBaseUpload(
+            video_file, chunksize=-1, resumable=True, mimetype="video/*"
+        )
+        request = youtube.videos().insert(
+            part="snippet,status", body=body, media_body=media
+        )
 
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            logger.info("  Upload progress: %d%%", int(status.progress() * 100))
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                logger.info("  Upload progress: %d%%", int(status.progress() * 100))
 
     return response["id"]
 
@@ -147,19 +145,53 @@ def upload_unlisted_youtube(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Queue a video for a publishing slot.")
-    parser.add_argument("--slot", choices=["A", "B"], required=True, help="Publishing slot (A or B)")
+    parser.add_argument(
+        "--slot",
+        choices=["A", "B"],
+        help="YouTube publishing slot (required when YouTube is a destination)",
+    )
+    parser.add_argument(
+        "--destination",
+        choices=["youtube", "telegram", "both"],
+        default="youtube",
+        help="Where to publish the next video (default: youtube)",
+    )
     args = parser.parse_args()
+
+    destinations = (
+        ["youtube", "telegram"] if args.destination == "both" else [args.destination]
+    )
+    if "youtube" in destinations and not args.slot:
+        parser.error("--slot is required when the destination includes YouTube")
 
     creds = get_credentials()
     drive = build("drive", "v3", credentials=creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube = (
+        build("youtube", "v3", credentials=creds)
+        if "youtube" in destinations
+        else None
+    )
 
     log = load_json(LOG_FILE, {"processed_file_ids": []})
     queue = load_json(QUEUE_FILE, [])
+    known_file_ids = set(log["processed_file_ids"])
+    known_file_ids.update(
+        item["drive_file_id"] for item in queue if item.get("drive_file_id")
+    )
+
+    telegram_client = None
+    if "telegram" in destinations or any(
+        item.get("telegram_status") == "pending" for item in queue
+    ):
+        telegram_client = TelegramClient.from_env()
+
+    if telegram_client:
+        retry_pending_telegram(drive, queue, telegram_client)
 
     videos = list_drive_videos(drive, DRIVE_FOLDER_ID)
     next_video = next(
-        (v for v in videos if v["id"] not in log["processed_file_ids"]), None
+        (v for v in videos if v["id"] not in known_file_ids),
+        None,
     )
 
     if not next_video:
@@ -168,49 +200,92 @@ def main() -> None:
 
     logger.info("Next video: %s", next_video["name"])
 
-    logger.info("Generating metadata with Groq...")
-    metadata = generate_metadata(next_video["name"])
-
     logger.info("Downloading from Drive...")
     local_path = download_video(drive, next_video["id"], next_video["name"])
 
-    # Critical section: keep cleanup in finally so a partial run never leaves
-    # a dangling temp file or a video stuck in limbo.
     try:
-        logger.info("Uploading to YouTube as unlisted...")
-        video_id = upload_unlisted_youtube(
-            youtube, local_path,
-            metadata["title"], metadata["description"], metadata["tags"],
-        )
-        logger.info("  YouTube video ID: %s", video_id)
-
-        logger.info("Making Drive file link-shareable for Instagram...")
-        drive_public_url = make_shareable(drive, next_video["id"])
-
-        go_live_at = next_slot_datetime(args.slot)
-        logger.info("Queued to go public/live at: %s", go_live_at.isoformat())
-
-        queue.append({
-            "youtube_video_id": video_id,
+        logger.info("Generating metadata from video frames with Groq...")
+        metadata = generate_metadata(next_video["name"], video_path=local_path)
+        now = datetime.now(timezone.utc).isoformat()
+        queue_entry = {
             "drive_file_id": next_video["id"],
-            "drive_public_url": drive_public_url,
-            "ig_caption": metadata["ig_caption"],
-            "go_live_at": go_live_at.isoformat(),
-            "slot": args.slot,
-            "published": False,
-        })
-        save_json(QUEUE_FILE, queue)
+            "file_name": next_video["name"],
+            "title": metadata["title"],
+            "description": metadata["description"],
+            "destinations": destinations,
+            "youtube_status": "scheduled" if "youtube" in destinations else "not_selected",
+            "telegram_status": "pending" if "telegram" in destinations else "not_selected",
+            "created_at": now,
+            "published": "youtube" not in destinations,
+        }
 
+        if "youtube" in destinations:
+            logger.info("Uploading to YouTube as unlisted...")
+            video_id = upload_unlisted_youtube(
+                youtube, local_path,
+                metadata["title"], metadata["description"], metadata["tags"],
+            )
+            logger.info("  YouTube video ID: %s", video_id)
+
+            go_live_at = next_slot_datetime(args.slot)
+            logger.info("Queued to go public/live at: %s", go_live_at.isoformat())
+            queue_entry.update({
+                "youtube_video_id": video_id,
+                "go_live_at": go_live_at.isoformat(),
+                "slot": args.slot,
+            })
+
+        queue.append(queue_entry)
         log["processed_file_ids"].append(next_video["id"])
+        save_json(QUEUE_FILE, queue)
         save_json(LOG_FILE, log)
 
+        if "telegram" in destinations:
+            send_telegram_video(
+                local_path, queue_entry, telegram_client, queue
+            )
+
     finally:
-        # Always clean up the temp file, even if an exception was raised above.
         if os.path.exists(local_path):
             os.remove(local_path)
             logger.debug("Removed temp file: %s", local_path)
 
-    logger.info("Done. Video will go public on YouTube and post to Instagram at the scheduled time.")
+    logger.info("Done. Destinations: %s", ", ".join(destinations))
+
+
+def send_telegram_video(
+    local_path: str,
+    queue_entry: dict,
+    telegram_client: TelegramClient,
+    queue: list[dict],
+) -> None:
+    """Send a queued video to Telegram and persist its delivery status."""
+    message_id = telegram_client.send_video(
+        local_path,
+        build_video_caption(queue_entry["title"], queue_entry["description"]),
+    )
+    queue_entry["telegram_status"] = "sent"
+    queue_entry["telegram_message_id"] = message_id
+    queue_entry["telegram_sent_at"] = datetime.now(timezone.utc).isoformat()
+    save_json(QUEUE_FILE, queue)
+    logger.info("  Telegram message ID: %s", message_id)
+
+
+def retry_pending_telegram(
+    drive, queue: list[dict], telegram_client: TelegramClient
+) -> None:
+    """Retry Telegram deliveries left pending by an interrupted prior run."""
+    for entry in queue:
+        if entry.get("telegram_status") != "pending":
+            continue
+
+        logger.info("Retrying pending Telegram delivery: %s", entry["file_name"])
+        local_path = download_video(drive, entry["drive_file_id"], entry["file_name"])
+        try:
+            send_telegram_video(local_path, entry, telegram_client, queue)
+        finally:
+            if os.path.exists(local_path):
+                os.remove(local_path)
 
 
 if __name__ == "__main__":

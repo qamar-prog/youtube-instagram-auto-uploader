@@ -8,9 +8,21 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# Local tool / IDE folders
+.kilo/
+
+# Nested unrelated project
+video-generator-2.0/
 
 # Runtime state (regenerated automatically, no need to track)
 temp_downloads/
+leads.json
+automation_queue.json
+automation_settings.json
+drive_automation_settings.json
+drive_automation_state.json
 
 # Logs
 *.log
@@ -19,3 +31,6 @@ temp_downloads/
 .DS_Store
 .vscode/
 *.swp
+
+# Browser automation profiles
+browser_profiles/

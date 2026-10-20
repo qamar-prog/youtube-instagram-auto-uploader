@@ -1,0 +1,10 @@
+{
+  "description": "Effortlessly schedule and manage video uploads to YouTube and Telegram with an intuitive dashboard, enhancing content automation for creators.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

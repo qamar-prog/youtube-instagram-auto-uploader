@@ -11,6 +11,9 @@ import os
 import time
 import functools
 import logging
+import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -49,10 +52,92 @@ def save_json(path: str, data: Any) -> None:
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+def _rate_limit_delay(exc: requests.HTTPError) -> float | None:
+    response = exc.response
+    if response is None:
+        return None
+
+    headers = response.headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            duration = _duration_seconds(retry_after)
+            if duration is not None:
+                return duration
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    reset_delays = []
+    for name, value in headers.items():
+        if name.lower().startswith("x-ratelimit-reset") and value:
+            seconds = _duration_seconds(str(value))
+            if seconds is not None:
+                reset_delays.append(seconds)
+    if reset_delays:
+        return max(reset_delays)
+
+    try:
+        payload = response.json()
+    except (ValueError, requests.JSONDecodeError):
+        payload = {}
+    if isinstance(payload, dict):
+        retry_after_value = payload.get("retry_after")
+        if isinstance(retry_after_value, (int, float)):
+            return max(0.0, float(retry_after_value))
+        error = payload.get("error")
+        message = error.get("message", "") if isinstance(error, dict) else ""
+        if message:
+            match = re.search(
+                r"(?:try again|reset|retry)(?: in| after)\s+([0-9a-z. ]+)",
+                message,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                return _duration_seconds(match.group(1))
+    return None
+
+
+def _duration_seconds(value: str) -> float | None:
+    normalized = value.strip().lower()
+    try:
+        return max(0.0, float(normalized))
+    except ValueError:
+        pass
+
+    compact = re.sub(r"\s+", "", normalized)
+    matches = list(
+        re.finditer(r"(\d+(?:\.\d+)?)(ms|sec|s|min|m|hr|h|d)", compact)
+    )
+    if not matches or "".join(match.group(0) for match in matches) != compact:
+        return None
+    factors = {
+        "ms": 0.001,
+        "s": 1.0,
+        "sec": 1.0,
+        "m": 60.0,
+        "min": 60.0,
+        "h": 3600.0,
+        "hr": 3600.0,
+        "d": 86400.0,
+    }
+    return sum(
+        float(match.group(1)) * factors[match.group(2)]
+        for match in matches
+    )
+
+
 def retry_on_transient(
     max_attempts: int = 4,
     base_delay: float = 2.0,
     backoff: float = 2.0,
+    max_retry_delay: float | None = None,
 ):
     """Decorator: retry the wrapped function on transient HTTP / network errors.
 
@@ -64,6 +149,8 @@ def retry_on_transient(
         max_attempts: total attempts (including the first).
         base_delay: seconds to wait before the second attempt.
         backoff: multiplier applied to the delay after each failure.
+        max_retry_delay: maximum server-directed delay before raising the
+                         original HTTP error so a fallback can be used.
 
     Raises:
         The last exception if all attempts are exhausted.
@@ -81,6 +168,25 @@ def retry_on_transient(
                     if status not in _RETRYABLE_STATUS:
                         raise  # non-retryable (4xx client errors, etc.)
                     last_exc = exc
+                    retry_delay = (
+                        _rate_limit_delay(exc)
+                        if status == 429
+                        else None
+                    )
+                    if (
+                        retry_delay is not None
+                        and max_retry_delay is not None
+                        and retry_delay > max_retry_delay
+                    ):
+                        logger.warning(
+                            "%s: HTTP 429 reset is %.1fs away; skipping early retry "
+                            "and allowing a configured fallback",
+                            func.__name__,
+                            retry_delay,
+                        )
+                        raise
+                    if retry_delay is not None:
+                        delay = retry_delay
                     logger.warning(
                         "%s: HTTP %s on attempt %d/%d — retrying in %.1fs",
                         func.__name__, status, attempt, max_attempts, delay,

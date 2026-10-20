@@ -1,56 +1,164 @@
-#YouTube + Instagram Auto-Uploader
+# YouTube and Telegram Auto-Publisher
 
 ![License](https://img.shields.io/github/license/Abhinavkumar-07/youtube-instagram-auto-uploader)
 ![Last Commit](https://img.shields.io/github/last-commit/Abhinavkumar-07/youtube-instagram-auto-uploader)
 ![Stars](https://img.shields.io/github/stars/Abhinavkumar-07/youtube-instagram-auto-uploader?style=social)
 
-Automatically publishes video clips from a Google Drive folder to YouTube and
-Instagram Reels on a schedule, twice a day, **completely free** — using Groq
-for AI-generated metadata and GitHub Actions for cloud automation. No paid
-tools, no server to maintain, no laptop that needs to stay on.
+Publishes video clips from a Google Drive folder to YouTube, a Telegram
+channel, or both. Groq generates the metadata, and a Telegram bot can act as a
+private control panel for selecting the destination.
 
 ---
 
-Videos sit in a Google Drive folder. This pipeline picks them one at a
-time, generates title/description/tags/caption with Groq, and publishes to
-**YouTube (unlisted → public)** and **Instagram Reels** at the same moment,
-twice a day. Works for any video content — podcast clips, gaming highlights,
-tutorials, vlogs — just set `CONTENT_DESCRIPTION` in `.env` to match yours.
+Videos sit in a Google Drive folder. The pipeline picks them one at a time,
+generates title/description/tags with Groq, and publishes to the selected
+destination. YouTube videos are uploaded as unlisted and made public at the
+selected slot. The CLI sends Telegram videos immediately; dashboard schedules
+can deliver them at their configured date and time.
 
 ## Quick start
 
 1. **Fork this repo**
 2. Get free API access: [Groq](https://console.groq.com/keys) (metadata) +
-   [Google Cloud](https://console.cloud.google.com/) (Drive/YouTube) +
-   [Meta Developers](https://developers.facebook.com/) (Instagram)
-3. Add your credentials as **GitHub Secrets** (Settings → Secrets and
-   variables → Actions) — see [Configure](#5-configure) below for the full list
-4. Enable GitHub Actions on your fork (Actions tab → "I understand, enable")
-5. Drop videos into your Drive folder — the pipeline picks them up automatically
+  [Google Cloud](https://console.cloud.google.com/) (Drive/YouTube)
+3. Configure the local `.env` file — see [Configure](#4-configure)
+4. Keep the local Telegram bot or uploader running on the machine that owns
+   `processed_log.json` and `publish_queue.json`
+5. Use the local menu or Telegram bot to choose a destination and publish a video
 
 Full setup walkthrough below if you want the details on each step.
 
-## Why two scripts
+## Publishing and state
 
 YouTube's `publishAt` scheduling only works if the video is `private` at
-upload time — it doesn't support "unlisted + auto-publish later." Instagram
-has no scheduling in its API at all — calling publish makes it go live
-immediately. So the pipeline is split in two:
+upload time — it doesn't support "unlisted + auto-publish later." So the
+pipeline is split in two:
 
 | Script | Runs | Does |
 |---|---|---|
-| `upload_unlisted.py` | 8 hours before a slot | Picks next video, generates metadata, uploads to YouTube as **unlisted** |
-| `publish_scheduled.py` | Every 10-15 min (checks the clock) | At the exact slot time: flips YouTube to **public** AND posts the same video to **Instagram Reels** |
+| `upload_unlisted.py` | When requested | Picks the next video and publishes to YouTube, Telegram, or both |
+| `publish_scheduled.py` | Every 10-15 min (checks the clock) | At the selected slot: flips queued YouTube videos to **public** |
 
-This gives you: video sits unlisted (link-shareable, not searchable) for 8
-hours, then goes public on YouTube and drops on Instagram simultaneously.
+`publish_queue.json` records each video's destination-specific status, while
+`processed_log.json` prevents Drive videos from being selected again. Keep
+these files on the same persistent machine as the local bot and scheduler.
+
+### Dashboard scheduling
+
+The web dashboard uses the FastAPI service and the same persistent queue. Start
+the API from the repository root and keep it running; its background worker
+checks due dashboard schedules every 15 seconds, uploads videos to YouTube,
+Instagram, or Facebook, sends videos to Telegram, and records per-platform
+success or failure in `publish_queue.json`.
+The frontend refreshes Drive videos and schedule statuses every 30 seconds.
+
+```powershell
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+In a second terminal:
+
+```powershell
+cd frontend
+npm run dev -- --host 127.0.0.1 --port 8443
+```
+
+Open `http://127.0.0.1:8443`. Only videos still available in Drive can be
+scheduled; a video leaves Available as soon as it has an active schedule, and
+completed deliveries disappear from Scheduled. Keep the API process running
+for scheduled deliveries to execute. Failed deliveries remain visible with
+their error message and can be retried from the dashboard.
+`SCHEDULER_POLL_SECONDS` can optionally change the polling interval (minimum
+5 seconds).
+
+In the dashboard's **Automation** section, **Drive auto-publishing** can
+schedule new Drive videos automatically at a custom interval from 1 to 1,440
+minutes for the selected YouTube, Instagram, and/or Facebook destinations.
+Saving enabled settings immediately queues available Drive videos in order,
+up to the configured per-platform daily limit; later Drive uploads are queued
+automatically. It only considers videos that are available (not already
+scheduled or published). Manual schedules are left alone. Set a maximum number
+of videos per platform per calendar day (defaults to 3, maximum 50); when that
+day's quota is reached, new automatic schedules are placed on the next day with
+room. The limit counts existing posts for that platform on the selected
+calendar day, including manual schedules. You can change the date and time of
+any pending schedule with its **Edit** button.
+Keep the uploader dashboard API running. Drive scanning defaults to every
+60 seconds and can be adjusted with
+`DRIVE_AUTOMATION_POLL_SECONDS` (minimum 15 seconds). Sign in to Instagram or
+Facebook in the Automation panel before enabling those destinations. Each
+social platform reuses one persistent local Chrome browser/profile for its
+scheduled uploads rather than opening a new browser for every video.
+
+For each scheduled video, metadata is generated once and saved to its queue
+item before delivery. Other platforms and retries reuse the saved title,
+description, and tags. If speech is present, it is transcribed and sent as
+text; sampled frames are sent to the vision model only when no intelligible
+transcript is available. Frame analysis requires `ffmpeg` and `ffprobe` on
+`PATH`. Audio transcription uses Groq's `whisper-large-v3-turbo` by default and
+can be changed with `GROQ_TRANSCRIPTION_MODEL`. Metadata tags are optional from
+the model; the app derives local tags from the generated title and description
+when absent.
+
+Groq rate-limit responses honor `Retry-After` and rate-limit reset headers. If
+Groq remains unavailable, configure an OpenAI-compatible provider with
+`METADATA_FALLBACK_API_KEY`, `METADATA_FALLBACK_BASE_URL`, and
+`METADATA_FALLBACK_MODEL`. The fallback API key is optional and is never
+required to use Groq.
+
+Instagram and Facebook can also be selected as publishing destinations in
+Automation or manual schedules. In **Automation**, use **Open login** for each
+platform, sign in yourself in the Chrome window (including any security
+challenges), then choose **Save login**. The app never asks for or stores your
+password. Selenium uses separate persistent Chrome profiles under
+`browser_profiles/`; the API must run on the same computer as Chrome. The
+browser stays open and is reused for scheduled uploads while the API is
+running. Stopping the API closes Chrome, but keeps its profile for later.
+Facebook posting requires a Page you manage and its URL in Automation settings
+(or `FACEBOOK_PAGE_URL` in `.env`). Instagram/Facebook uploads use video files
+downloaded from the scheduled Google Drive video ID; they do not use the video
+generator's output folder. Keep the dashboard API running for the selected
+publish times. The separate `social_upload_manager.py` command is not needed
+for dashboard scheduling.
+
+### Automated video generation
+
+The **Automation** dashboard section accepts one topic per line, stores the
+prompt queue locally, and lets you configure destinations, timezone, and daily
+publish times. For each topic, the configured idea model creates a brief and a
+different review model checks it. The existing video generator then renders
+the reviewed brief, uploads a timestamped MP4 to the configured Drive folder,
+and reserves the next available slot in the same publishing queue. Failed jobs
+stay visible in the dashboard and can be retried.
+
+Run the uploader dashboard API on port 8000 as above. In a separate terminal,
+start the generator backend on port 8001 and its worker:
+
+```powershell
+cd video-generator-2.0\backend
+uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+```powershell
+cd video-generator-2.0\backend
+python -m app.workers.manager
+```
+
+Configure `GEMINI_API_KEY` and `GLM_API_KEY` in
+`video-generator-2.0\backend\.env` (or select two different configured
+providers with `AUTOMATION_IDEA_PROVIDER` and
+`AUTOMATION_REVIEW_PROVIDER`). The root `.env` must also have a writable
+`DRIVE_FOLDER_ID`. The automation worker runs inside the uploader dashboard
+API, so keep both backends and the generator worker running.
 
 ## Default daily slots (edit in `.env`)
 
-- **Slot A: 5:30 PM IST** = 8:00 AM ET = 1:00 PM UK — US morning commute, UK lunch
-- **Slot B: 9:30 PM IST** = 12:00 PM ET = 5:00 PM UK — US lunch, UK evening commute
+- **Slot A: 5:30 PM PKT**
+- **Slot B: 9:30 PM PKT**
 
-That's 2 videos/day, published simultaneously to both platforms.
+The CLI uploader uses these slots for YouTube; it sends Telegram channel videos
+immediately. Dashboard and automation schedules use their selected platform
+times.
 
 ## One-time setup
 
@@ -61,30 +169,7 @@ That's 2 videos/day, published simultaneously to both platforms.
 3. OAuth consent screen: External, add yourself as a test user.
 4. Create OAuth Client ID (Desktop app), download JSON as `client_secret.json` in this folder.
 
-### 2. Meta / Instagram setup
-
-Instagram's API requires a Business or Creator account linked to a Facebook Page.
-
-1. Create a Facebook account if you don't have one: https://www.facebook.com/
-2. Create a Facebook Page (any name/category is fine — it just needs to exist): https://www.facebook.com/pages/create
-3. On Instagram: Settings → Account type → switch to **Professional account** →
-   choose **Creator** or **Business** → link it to the Page you just made.
-4. Go to https://developers.facebook.com/ → create an app (type: **Business**).
-5. In the app, add the **Instagram Graph API** product.
-6. Use the **Graph API Explorer** (developers.facebook.com/tools/explorer) to:
-   - Select your app, generate a **User Access Token** with `instagram_basic`,
-     `instagram_content_publish`, and `pages_show_list` permissions.
-   - Exchange it for a **long-lived token** (60 days) — the Explorer has a button
-     for this, or use the `/oauth/access_token` endpoint with `grant_type=fb_exchange_token`.
-   - Find your **Instagram Business Account ID**: call `GET /me/accounts` to get your
-     Page ID, then `GET /{page-id}?fields=instagram_business_account`.
-7. Put both values in `.env` as `META_ACCESS_TOKEN` and `IG_BUSINESS_ACCOUNT_ID`.
-
-Note: long-lived tokens expire after 60 days — you'll need to refresh it
-periodically (a reminder on your calendar is easiest; a token-refresh script
-can be added later if this becomes a hassle).
-
-### 3. Python environment
+### 2. Python environment
 
 ```bash
 python -m venv venv
@@ -92,85 +177,83 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 4. Authenticate Google (one-time, opens a browser)
+### 3. Authenticate Google (one-time, opens a browser)
 
 ```bash
 python oauth_setup.py
 ```
 
-### 5. Configure
+### 4. Configure
 
 Copy `.env.example` to `.env` and fill in:
 - `DRIVE_FOLDER_ID`
 - `GROQ_API_KEY`
+- `GEOAPIFY_API_KEY` (for geocoding lead addresses)
 - `SLOT_A_TIME` / `SLOT_B_TIME` (defaults already set)
-- `META_ACCESS_TOKEN` / `IG_BUSINESS_ACCOUNT_ID`
+- `TELEGRAM_BOT_TOKEN` (from @BotFather)
+- `TELEGRAM_CHAT_ID` (the channel ID; add the bot as a channel administrator)
+- `TELEGRAM_ALLOWED_USER_IDS` (comma-separated numeric IDs allowed to use the bot)
 
-### 6. Run
+### 5. Run
 
-Queue a video for slot A (run this ~8 hours before 5:30 PM IST, e.g. 9:30 AM):
+Publish the next video to YouTube at slot A:
 ```bash
 python upload_unlisted.py --slot A
 ```
 
-Queue a video for slot B (run ~8 hours before 9:30 PM IST, e.g. 1:30 PM):
+Publish to Telegram only, or to both destinations:
 ```bash
-python upload_unlisted.py --slot B
+python upload_unlisted.py --destination telegram
+python upload_unlisted.py --destination both --slot B
 ```
 
-Then keep this running on a schedule so queued videos actually go live:
+The Telegram bot offers buttons to select YouTube, Telegram, or both:
+```bash
+python telegram_bot.py
+```
+
+Keep the bot process running to accept control messages. Schedule the following
+local command every 10–15 minutes to make queued YouTube videos public:
 ```bash
 python publish_scheduled.py
 ```
 
-## Automating: runs in the cloud via GitHub Actions (no laptop needed)
+### Lead finder and combined menu
 
-This pipeline runs on GitHub's servers on a schedule — your computer can be off.
-Here's what's set up and why:
+Find nearby business leads by selecting a country, city, and Geoapify category:
 
-**1. Code lives in a private GitHub repo**, pushed with `git push`. `.gitignore`
-keeps `.env`, `client_secret.json`, and `token.json` out of the repo — those are
-secrets and should never be committed.
+```bash
+python lead_generator.py --country Pakistan --city Lahore --category commercial --limit 20
+```
 
-**2. Secrets are stored in GitHub → Settings → Secrets and variables → Actions**,
-encrypted, one per value:
-- `DRIVE_FOLDER_ID`
-- `GROQ_API_KEY`
-- `META_ACCESS_TOKEN`
-- `IG_BUSINESS_ACCOUNT_ID`
-- `GOOGLE_CLIENT_SECRET_JSON` — the full contents of your local `client_secret.json`
-- `GOOGLE_TOKEN_JSON` — the full contents of your local `token.json`
+Results are saved to `leads.json`. Or use the combined menu:
 
-**3. `.github/workflows/pipeline.yml`** is the automation itself. On each scheduled
-run, it: checks out the repo → installs dependencies → rebuilds `client_secret.json`
-and `token.json` from the two secrets above → runs the right script for that time
-slot → commits the updated `processed_log.json`/`publish_queue.json` back to the
-repo so the next run remembers what's already been done.
+```bash
+python run.py
+```
 
-**4. Three schedules** (cron times are UTC, converted from IST):
-- Slot A upload: `0 4 * * *` (9:30 AM IST)
-- Slot B upload: `0 8 * * *` (1:30 PM IST)
-- Publish check: `*/15 * * * *` (every 15 min, all day)
+The menu supports lead search, destination selection, YouTube publishing, and
+starting the Telegram control bot.
 
-**5. Manual testing**: GitHub repo → Actions tab → "PoddyGo Pipeline" → "Run workflow"
-button — triggers an on-demand run without waiting for the schedule.
+## Local runner and GitHub Actions
 
-### Two expiry dates to track
+The Telegram bot and local commands share JSON state on the local machine.
+GitHub Actions runs on a separate filesystem, so it must not publish at the
+same time: the workflow is disabled unless the repository variable
+`ENABLE_GITHUB_PUBLISHING` is explicitly set to `true`. Do not enable it while
+using local bot mode; doing so creates a separate queue and can publish the
+same Drive video twice.
+
+### Expiry date to track
 
 - **Google refresh token expires in 7 days** unless the OAuth app is moved out of
   "Testing" mode. Fix: Google Cloud Console → your project → **Google Auth Platform
   → Audience** → **Publish app**. Do this once, early — it removes the 7-day limit.
-- **Meta access token expires in ~60 days** (mid-September 2026, if generated in
-  July 2026). When it expires, Instagram posting silently fails. Fix: redo the
-  `fb_exchange_token` exchange (see Meta setup section above) and update the
-  `META_ACCESS_TOKEN` secret on GitHub with the new token.
 
 ## Notes
 
-- YouTube free quota: ~6 uploads/day (10,000 units, ~1,600/upload) — 2/day is well within it.
-- Instagram fetches the video from the Drive shareable link server-side — that link
-  is created automatically by `upload_unlisted.py` (`anyone with link, viewer` permission).
-- `publish_queue.json` tracks what's waiting to go live; `processed_log.json` tracks
-  what's already been picked from Drive so nothing gets uploaded twice.
-- If Instagram publish fails but YouTube succeeded, the script logs it and continues —
-  check the console output and retry manually if needed.
+- `TELEGRAM_ALLOWED_USER_IDS` is an access control list; leave it configured
+  with only trusted numeric Telegram user IDs.
+- A failed Telegram delivery is retained as pending in `publish_queue.json` and
+  retried the next time an upload command runs.
+- Never put API keys or bot tokens in `.env.example`, source control, or logs.

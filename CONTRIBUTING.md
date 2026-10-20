@@ -7,10 +7,9 @@ Thanks for your interest! Pull requests, bug reports, and feature suggestions ar
 ```
 auth.py               — shared Google OAuth credentials helper (SCOPES, get_credentials)
 utils.py              — shared JSON I/O helpers + retry_on_transient decorator
-metadata_generator.py — calls Groq to produce YouTube title/description/tags + IG caption
+metadata_generator.py — calls Groq to produce YouTube title/description/tags
 upload_unlisted.py    — STEP 1: picks next Drive video, generates metadata, uploads unlisted to YouTube, queues for later
-publish_scheduled.py  — STEP 2: at go-live time flips YouTube public, posts to Instagram, revokes Drive public link
-instagram_uploader.py — thin wrapper around Meta Graph API for publishing Reels
+publish_scheduled.py  — STEP 2: at go-live time flips YouTube public
 oauth_setup.py        — one-time browser-based Google OAuth flow
 ```
 
@@ -33,8 +32,8 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and fill in DRIVE_FOLDER_ID, GROQ_API_KEY, META_ACCESS_TOKEN,
-# and IG_BUSINESS_ACCOUNT_ID. Leave slots at defaults to start.
+# Edit .env and fill in DRIVE_FOLDER_ID and GROQ_API_KEY.
+# Leave slots at defaults to start.
 ```
 
 Then place your `client_secret.json` in the project root and run:
@@ -58,7 +57,6 @@ fake_file = {"id": "FAKE_ID", "name": "test_clip.mp4", "mimeType": "video/mp4"}
 mock_drive = MagicMock()
 mock_drive.files().list().execute.return_value = {"files": [fake_file]}
 mock_drive.files().get_media.return_value = MagicMock()
-mock_drive.permissions().create().execute.return_value = {}
 
 # ---- Mock YouTube: returns a fake video ID ----
 mock_youtube = MagicMock()
@@ -71,7 +69,6 @@ fake_metadata = {
     "title": "Test Title",
     "description": "A test description. #test",
     "tags": ["test", "video"],
-    "ig_caption": "Test caption #reels",
 }
 
 with patch("upload_unlisted.get_credentials", return_value=MagicMock()), \
@@ -98,9 +95,6 @@ Manually add an entry to `publish_queue.json` with a `go_live_at` time in the pa
 [
   {
     "youtube_video_id": "TEST_YT_ID",
-    "drive_file_id": "TEST_DRIVE_ID",
-    "drive_public_url": "https://drive.google.com/uc?export=download&id=TEST_DRIVE_ID",
-    "ig_caption": "Test caption #reels",
     "go_live_at": "2024-01-01T00:00:00+05:30",
     "slot": "A",
     "published": false
