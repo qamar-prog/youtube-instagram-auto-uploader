@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "platforms": [
+    "youtube"
+  ],
+  "timezone": "Asia/Karachi",
+  "youtube_times": [
+    "17:30",
+    "21:30"
+  ],
+  "telegram_times": [
+    "17:30",
+    "21:30"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "interval_minutes": 3,
+  "max_videos_per_day": 2,
+  "platforms": [
+    "facebook"
+  ],
+  "timezone": "Asia/Karachi",
+  "facebook_page_url": "https://web.facebook.com/profile.php?id=61595151675865"
+}

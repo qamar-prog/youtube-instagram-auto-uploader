@@ -1,8 +1,3 @@
-# Secrets — NEVER commit these
-.env
-client_secret.json
-token.json
-
 # Python environment
 venv/
 __pycache__/
@@ -16,13 +11,13 @@ __pycache__/
 # Nested unrelated project
 video-generator-2.0/
 
-# Runtime state (regenerated automatically, no need to track)
+# Secrets — keep local only (GitHub push protection blocks these)
+.env
+client_secret.json
+token.json
+
+# Runtime state
 temp_downloads/
-leads.json
-automation_queue.json
-automation_settings.json
-drive_automation_settings.json
-drive_automation_state.json
 
 # Logs
 *.log
